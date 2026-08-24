@@ -1,0 +1,197 @@
+name: Find buildDeploy Workflows
+
+on:
+  workflow_dispatch:
+    inputs:
+      organization:
+        description: "GitHub organization to scan"
+        required: true
+        type: string
+      include_archived:
+        description: "Include archived repositories"
+        required: false
+        default: false
+        type: boolean
+      parallel_jobs:
+        description: "Number of repositories to check in parallel"
+        required: false
+        default: "10"
+        type: choice
+        options:
+          - "5"
+          - "10"
+          - "20"
+          - "30"
+
+permissions:
+  contents: read
+
+jobs:
+  scan-repositories:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check GitHub CLI
+        run: gh --version
+
+      - name: Get organization repositories
+        env:
+          GH_TOKEN: ${{ secrets.ORG_TOKEN }}
+          ORGANIZATION: ${{ inputs.organization }}
+          INCLUDE_ARCHIVED: ${{ inputs.include_archived }}
+        run: |
+          set -euo pipefail
+
+          echo "Retrieving repositories from: $ORGANIZATION"
+
+          gh api \
+            --paginate \
+            "/orgs/$ORGANIZATION/repos?per_page=100&type=all" \
+            --jq '.[] | select(.disabled == false) | "\(.name),\(.default_branch),\(.archived),\(.private)"' \
+            > all-repositories.csv
+
+          if [ "$INCLUDE_ARCHIVED" != "true" ]; then
+            awk -F',' '$3 != "true"' all-repositories.csv \
+              > repositories.csv
+          else
+            cp all-repositories.csv repositories.csv
+          fi
+
+          echo "Repositories found:"
+          wc -l repositories.csv
+
+          echo "First repositories:"
+          head repositories.csv
+
+      - name: Create repository scanner
+        run: |
+          cat > check-repository.sh <<'EOF'
+          #!/usr/bin/env bash
+
+          set -uo pipefail
+
+          ORG="$1"
+          REPO="$2"
+          DEFAULT_BRANCH="$3"
+          ARCHIVED="$4"
+          PRIVATE="$5"
+
+          WORKFLOW_FOUND=""
+          STATUS="NOT_FOUND"
+
+          for WORKFLOW in \
+            ".github/workflows/buildDeploy.yml" \
+            ".github/workflows/buildDeploy.yaml"
+          do
+
+            HTTP_STATUS=$(gh api \
+              "/repos/$ORG/$REPO/contents/$WORKFLOW" \
+              --method GET \
+              --silent \
+              2>/dev/null \
+              -i \
+              | awk 'NR==1 {print $2}')
+
+            if [ "$HTTP_STATUS" = "200" ]; then
+              WORKFLOW_FOUND="$WORKFLOW"
+              STATUS="FOUND"
+              break
+            fi
+
+          done
+
+          echo "$ORG,$REPO,$DEFAULT_BRANCH,$ARCHIVED,$PRIVATE,$STATUS,$WORKFLOW_FOUND"
+          EOF
+
+          chmod +x check-repository.sh
+
+      - name: Scan repositories in parallel
+        env:
+          GH_TOKEN: ${{ secrets.ORG_TOKEN }}
+          ORGANIZATION: ${{ inputs.organization }}
+          PARALLEL_JOBS: ${{ inputs.parallel_jobs }}
+        run: |
+          set -euo pipefail
+
+          echo "organization,repository,default_branch,archived,private,status,workflow" \
+            > builddeploy-report.csv
+
+          export GH_TOKEN
+          export ORGANIZATION
+
+          cat repositories.csv | \
+          xargs \
+            -P "$PARALLEL_JOBS" \
+            -n 1 \
+            bash -c '
+              IFS="," read -r REPO DEFAULT_BRANCH ARCHIVED PRIVATE <<< "$0"
+
+              ./check-repository.sh \
+                "$ORGANIZATION" \
+                "$REPO" \
+                "$DEFAULT_BRANCH" \
+                "$ARCHIVED" \
+                "$PRIVATE"
+            ' \
+            >> builddeploy-report.csv
+
+      - name: Display repositories with buildDeploy workflow
+        run: |
+          echo ""
+          echo "============================================"
+          echo "Repositories with buildDeploy workflow"
+          echo "============================================"
+
+          awk -F',' '
+            NR == 1 || $6 == "FOUND"
+          ' builddeploy-report.csv
+
+      - name: Generate filtered report
+        run: |
+          {
+            head -n 1 builddeploy-report.csv
+            grep ',FOUND,' builddeploy-report.csv || true
+          } > repositories-with-builddeploy.csv
+
+          echo ""
+          echo "Repositories with buildDeploy:"
+          echo $(( $(wc -l < repositories-with-builddeploy.csv) - 1 ))
+
+      - name: Upload complete report
+        uses: actions/upload-artifact@v4
+        with:
+          name: builddeploy-scan-report
+          path: |
+            builddeploy-report.csv
+            repositories-with-builddeploy.csv
+          retention-days: 30
+
+      - name: Job summary
+        run: |
+          TOTAL=$(($(wc -l < builddeploy-report.csv) - 1))
+          FOUND=$(grep -c ',FOUND,' builddeploy-report.csv || true)
+
+          {
+            echo "# buildDeploy Workflow Scan"
+            echo ""
+            echo "| Metric | Value |"
+            echo "|---|---:|"
+            echo "| Organization | ${{ inputs.organization }} |"
+            echo "| Repositories scanned | $TOTAL |"
+            echo "| buildDeploy workflows found | $FOUND |"
+            echo ""
+
+            echo "## Repositories with buildDeploy"
+
+            echo ""
+
+            echo "| Repository | Default Branch | Workflow |"
+            echo "|---|---|---|"
+
+            awk -F',' '
+              $6 == "FOUND" {
+                printf "| %s | %s | `%s` |\n", $2, $3, $7
+              }
+            ' builddeploy-report.csv
+
+          } >> "$GITHUB_STEP_SUMMARY"
