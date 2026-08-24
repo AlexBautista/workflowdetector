@@ -1,0 +1,502 @@
+name: Scan Organization Workflow
+
+on:
+  workflow_dispatch:
+    inputs:
+      organization:
+        description: "GitHub organization to scan"
+        required: true
+        type: string
+
+      workflow_file:
+        description: "Workflow filename or full path to detect"
+        required: true
+        default: "buildDeploy.yml"
+        type: string
+
+      include_archived:
+        description: "Include archived repositories"
+        required: true
+        default: false
+        type: boolean
+
+      parallel_jobs:
+        description: "Number of repositories to scan in parallel"
+        required: true
+        default: "10"
+        type: choice
+        options:
+          - "5"
+          - "10"
+          - "15"
+          - "20"
+
+permissions:
+  contents: read
+
+jobs:
+  scan-repositories:
+    name: Scan Repositories
+    runs-on: ubuntu-latest
+
+    steps:
+
+      - name: Validate and normalize workflow path
+        id: config
+        env:
+          WORKFLOW_FILE: ${{ inputs.workflow_file }}
+        run: |
+          set -euo pipefail
+
+          TARGET="$WORKFLOW_FILE"
+
+          if [[ -z "$TARGET" ]]; then
+            echo "Workflow filename cannot be empty."
+            exit 1
+          fi
+
+          if [[ "$TARGET" == *".."* ]]; then
+            echo "Invalid workflow path."
+            exit 1
+          fi
+
+          # Allow only a filename:
+          # buildDeploy.yml
+          #
+          # Or a complete path:
+          # .github/workflows/buildDeploy.yml
+
+          if [[ "$TARGET" != .github/workflows/* ]]; then
+            TARGET=".github/workflows/$TARGET"
+          fi
+
+          echo "target_path=$TARGET" >> "$GITHUB_OUTPUT"
+
+          echo "Target workflow:"
+          echo "$TARGET"
+
+      - name: Display GitHub CLI version
+        run: |
+          gh --version
+
+      - name: Get organization repositories
+        env:
+          GH_TOKEN: ${{ secrets.ORG_TOKEN }}
+          ORGANIZATION: ${{ inputs.organization }}
+          INCLUDE_ARCHIVED: ${{ inputs.include_archived }}
+        run: |
+          set -euo pipefail
+
+          echo "Retrieving repositories from organization: $ORGANIZATION"
+
+          gh api \
+            --paginate \
+            "/orgs/$ORGANIZATION/repos?per_page=100&type=all" \
+            --jq '
+              .[]
+              | select(.disabled == false)
+              | [
+                  .name,
+                  .default_branch,
+                  .archived,
+                  .private
+                ]
+              | @tsv
+            ' \
+            > all-repositories.tsv
+
+          echo "Total repositories returned:"
+          wc -l all-repositories.tsv
+
+          if [[ "$INCLUDE_ARCHIVED" == "true" ]]; then
+
+            cp all-repositories.tsv repositories.tsv
+
+          else
+
+            awk -F '\t' '$3 != "true"' \
+              all-repositories.tsv \
+              > repositories.tsv
+
+          fi
+
+          TOTAL=$(wc -l < repositories.tsv)
+
+          echo ""
+          echo "Repositories selected for scanning: $TOTAL"
+
+          if [[ "$TOTAL" -eq 0 ]]; then
+            echo "No repositories found."
+            exit 1
+          fi
+
+      - name: Create repository scanner
+        run: |
+          cat > check-repository.sh <<'EOF'
+          #!/usr/bin/env bash
+
+          set -uo pipefail
+
+          ORGANIZATION="$1"
+          REPOSITORY="$2"
+          DEFAULT_BRANCH="$3"
+          ARCHIVED="$4"
+          PRIVATE="$5"
+          TARGET_PATH="$6"
+
+          MAX_RETRIES=5
+          RETRY_DELAY=5
+
+          STATUS="ERROR"
+          WORKFLOW_ID=""
+          WORKFLOW_NAME=""
+          WORKFLOW_PATH=""
+          WORKFLOW_STATE=""
+          ERROR_MESSAGE=""
+
+          API_ENDPOINT="/repos/$ORGANIZATION/$REPOSITORY/actions/workflows?per_page=100"
+
+          for ATTEMPT in $(seq 1 "$MAX_RETRIES"); do
+
+            RESPONSE_FILE=$(mktemp)
+            HEADER_FILE=$(mktemp)
+
+            HTTP_STATUS=$(gh api \
+              "$API_ENDPOINT" \
+              --paginate \
+              --include \
+              > "$RESPONSE_FILE" 2> "$HEADER_FILE" || true)
+
+            EXIT_CODE=$?
+
+            # Extract HTTP status from the response.
+            STATUS_CODE=$(grep -E '^HTTP/' "$RESPONSE_FILE" \
+              | tail -1 \
+              | awk '{print $2}' || true)
+
+            # A successful request can contain multiple HTTP header blocks
+            # because of pagination.
+
+            if [[ "$STATUS_CODE" == "200" ]]; then
+
+              # Remove HTTP headers before processing JSON.
+              sed -n '/^{/,$p' "$RESPONSE_FILE" > response.json || true
+
+              if [[ -s response.json ]]; then
+
+                WORKFLOW_DATA=$(jq \
+                  --arg target "$TARGET_PATH" \
+                  -r '
+                    .workflows[]
+                    | select(.path == $target)
+                    | [
+                        .id,
+                        .name,
+                        .path,
+                        .state
+                      ]
+                    | @tsv
+                  ' response.json \
+                  | head -n 1)
+
+                if [[ -n "$WORKFLOW_DATA" ]]; then
+
+                  IFS=$'\t' read -r \
+                    WORKFLOW_ID \
+                    WORKFLOW_NAME \
+                    WORKFLOW_PATH \
+                    WORKFLOW_STATE \
+                    <<< "$WORKFLOW_DATA"
+
+                  STATUS="FOUND"
+
+                else
+                  STATUS="NOT_FOUND"
+                fi
+
+                rm -f \
+                  "$RESPONSE_FILE" \
+                  "$HEADER_FILE" \
+                  response.json
+
+                break
+              fi
+            fi
+
+            # If we reach this point, the API call failed.
+            #
+            # Retry:
+            # - 429 Too Many Requests
+            # - 5xx server errors
+            # - 403, which can also be secondary rate limiting
+
+            if [[ "$STATUS_CODE" == "429" ]] ||
+               [[ "$STATUS_CODE" == "403" ]] ||
+               [[ "$STATUS_CODE" =~ ^5 ]]; then
+
+              if [[ "$ATTEMPT" -lt "$MAX_RETRIES" ]]; then
+
+                SLEEP_TIME=$((RETRY_DELAY * ATTEMPT))
+
+                echo \
+                  "Retrying $ORGANIZATION/$REPOSITORY after ${SLEEP_TIME}s. HTTP: ${STATUS_CODE:-unknown}" \
+                  >&2
+
+                sleep "$SLEEP_TIME"
+
+                rm -f \
+                  "$RESPONSE_FILE" \
+                  "$HEADER_FILE"
+
+                continue
+              fi
+            fi
+
+            ERROR_MESSAGE=$(tr '\n' ' ' < "$HEADER_FILE" \
+              | sed 's/[[:space:]]\+/ /g' \
+              | cut -c1-300)
+
+            rm -f \
+              "$RESPONSE_FILE" \
+              "$HEADER_FILE"
+
+            break
+
+          done
+
+          if [[ "$STATUS" == "ERROR" ]] && [[ -z "$ERROR_MESSAGE" ]]; then
+            ERROR_MESSAGE="API request failed after $MAX_RETRIES attempts"
+          fi
+
+          # TSV output:
+          #
+          # organization
+          # repository
+          # default_branch
+          # archived
+          # private
+          # status
+          # workflow_id
+          # workflow_name
+          # workflow_path
+          # workflow_state
+          # error
+
+          printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
+            "$ORGANIZATION" \
+            "$REPOSITORY" \
+            "$DEFAULT_BRANCH" \
+            "$ARCHIVED" \
+            "$PRIVATE" \
+            "$STATUS" \
+            "$WORKFLOW_ID" \
+            "$WORKFLOW_NAME" \
+            "$WORKFLOW_PATH" \
+            "$WORKFLOW_STATE" \
+            "$ERROR_MESSAGE"
+          EOF
+
+          chmod +x check-repository.sh
+
+      - name: Scan repositories
+        env:
+          GH_TOKEN: ${{ secrets.ORG_TOKEN }}
+          ORGANIZATION: ${{ inputs.organization }}
+          TARGET_PATH: ${{ steps.config.outputs.target_path }}
+          PARALLEL_JOBS: ${{ inputs.parallel_jobs }}
+        run: |
+          set -euo pipefail
+
+          echo "Starting repository scan"
+          echo "Organization: $ORGANIZATION"
+          echo "Workflow: $TARGET_PATH"
+          echo "Parallel jobs: $PARALLEL_JOBS"
+
+          export GH_TOKEN
+          export ORGANIZATION
+          export TARGET_PATH
+
+          TOTAL=$(wc -l < repositories.tsv)
+
+          echo ""
+          echo "Scanning $TOTAL repositories..."
+
+          cat repositories.tsv |
+          xargs \
+            -P "$PARALLEL_JOBS" \
+            -n 1 \
+            -d '\n' \
+            bash -c '
+              IFS=$'\''\t'\'' read -r \
+                REPOSITORY \
+                DEFAULT_BRANCH \
+                ARCHIVED \
+                PRIVATE \
+                <<< "$1"
+
+              ./check-repository.sh \
+                "$ORGANIZATION" \
+                "$REPOSITORY" \
+                "$DEFAULT_BRANCH" \
+                "$ARCHIVED" \
+                "$PRIVATE" \
+                "$TARGET_PATH"
+            ' _ \
+            > scan-results.tsv
+
+      - name: Generate complete CSV report
+        run: |
+          {
+            echo 'organization,repository,default_branch,archived,private,status,workflow_id,workflow_name,workflow_path,workflow_state,error'
+
+            awk -F '\t' '
+              function esc(value) {
+                gsub(/"/, "\"\"", value)
+                return "\"" value "\""
+              }
+
+              {
+                for (i = 1; i <= NF; i++) {
+                  printf "%s", esc($i)
+
+                  if (i < NF)
+                    printf ","
+                }
+
+                printf "\n"
+              }
+            ' scan-results.tsv
+
+          } > workflow-scan-report.csv
+
+      - name: Generate repositories with workflow
+        run: |
+          {
+            head -n 1 workflow-scan-report.csv
+
+            awk -F '\t' '
+              $6 == "FOUND" {
+                printf "\"%s\",\"%s\",\"%s\",\"%s\",\"%s\",\"%s\",\"%s\",\"%s\",\"%s\",\"%s\",\"%s\"\n",
+                  $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11
+              }
+            ' scan-results.tsv
+
+          } > repositories-with-workflow.csv
+
+      - name: Generate error report
+        run: |
+          {
+            head -n 1 workflow-scan-report.csv
+
+            awk -F '\t' '
+              $6 == "ERROR" {
+                printf "\"%s\",\"%s\",\"%s\",\"%s\",\"%s\",\"%s\",\"%s\",\"%s\",\"%s\",\"%s\",\"%s\"\n",
+                  $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11
+              }
+            ' scan-results.tsv
+
+          } > workflow-scan-errors.csv
+
+      - name: Display results
+        run: |
+          TOTAL=$(wc -l < scan-results.tsv)
+
+          FOUND=$(awk -F '\t' '$6 == "FOUND"' scan-results.tsv | wc -l)
+          NOT_FOUND=$(awk -F '\t' '$6 == "NOT_FOUND"' scan-results.tsv | wc -l)
+          ERRORS=$(awk -F '\t' '$6 == "ERROR"' scan-results.tsv | wc -l)
+
+          echo ""
+          echo "============================================"
+          echo "SCAN RESULTS"
+          echo "============================================"
+          echo "Total repositories : $TOTAL"
+          echo "FOUND              : $FOUND"
+          echo "NOT_FOUND          : $NOT_FOUND"
+          echo "ERROR              : $ERRORS"
+          echo ""
+
+          echo "Repositories where workflow was found:"
+          echo ""
+
+          awk -F '\t' '
+            $6 == "FOUND" {
+              printf "%-50s %s\n", $2, $9
+            }
+          ' scan-results.tsv
+
+      - name: Upload scan reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: workflow-scan-report-${{ github.run_number }}
+          path: |
+            workflow-scan-report.csv
+            repositories-with-workflow.csv
+            workflow-scan-errors.csv
+          retention-days: 30
+
+      - name: Create job summary
+        env:
+          ORGANIZATION: ${{ inputs.organization }}
+          TARGET_PATH: ${{ steps.config.outputs.target_path }}
+        run: |
+          TOTAL=$(wc -l < scan-results.tsv)
+
+          FOUND=$(awk -F '\t' '$6 == "FOUND"' scan-results.tsv | wc -l)
+          NOT_FOUND=$(awk -F '\t' '$6 == "NOT_FOUND"' scan-results.tsv | wc -l)
+          ERRORS=$(awk -F '\t' '$6 == "ERROR"' scan-results.tsv | wc -l)
+
+          {
+            echo "# Organization Workflow Scan"
+            echo ""
+
+            echo "## Configuration"
+            echo ""
+            echo "| Setting | Value |"
+            echo "|---|---|"
+            echo "| Organization | $ORGANIZATION |"
+            echo "| Target workflow | \`$TARGET_PATH\` |"
+            echo ""
+
+            echo "## Results"
+            echo ""
+            echo "| Status | Count |"
+            echo "|---|---:|"
+            echo "| Repositories scanned | $TOTAL |"
+            echo "| Workflow found | $FOUND |"
+            echo "| Workflow not found | $NOT_FOUND |"
+            echo "| Errors | $ERRORS |"
+            echo ""
+
+            if [[ "$FOUND" -gt 0 ]]; then
+
+              echo "## Repositories with workflow"
+              echo ""
+
+              echo "| Repository | Default Branch | Workflow Name | State |"
+              echo "|---|---|---|---|"
+
+              awk -F '\t' '
+                $6 == "FOUND" {
+                  printf "| %s | %s | %s | %s |\n",
+                    $2,
+                    $3,
+                    $8,
+                    $10
+                }
+              ' scan-results.tsv
+
+            fi
+
+            if [[ "$ERRORS" -gt 0 ]]; then
+
+              echo ""
+              echo "## Errors"
+              echo ""
+
+              echo "Some repositories could not be scanned. Check the uploaded artifact:"
+
+              echo "\`workflow-scan-errors.csv\`"
+
+            fi
+
+          } >> "$GITHUB_STEP_SUMMARY"
